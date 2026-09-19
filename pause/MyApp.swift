@@ -15,9 +15,11 @@ class BreakManager: ObservableObject {
         startTimer()
     }
     
-    func startTimer() {
+    func startTimer(seconds: Int? = nil) {
         stopTimer()
-        secondsRemaining = selectedDuration * 60
+        
+        // 'seconds' lets a snooze delay the next pause without changing the chosen gap
+        secondsRemaining = seconds ?? selectedDuration * 60
         
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -38,14 +40,14 @@ class BreakManager: ObservableObject {
         stopTimer()
         isBreakActive = true
         
-        // Directly launch the window using AppKit on the main thread
+        // Directly launch the window
         DispatchQueue.main.async {
             WindowManager.shared.showWindow(with: self)
         }
     }
 }
 
-// A borderless window that is still allowed to take focus
+//Making it a borderless window (not using standard fullscreen)
 final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
@@ -53,46 +55,70 @@ final class OverlayWindow: NSWindow {
 // A dedicated helper to manage the window instance safely
 class WindowManager {
     static let shared = WindowManager()
-    private var window: NSWindow?
-    
+    // Making the window show up on all monitors
+    private var windows: [NSWindow] = []
+
     func showWindow(with manager: BreakManager) {
-        // Use the screen the user is currently working on
-        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
-        
-        // Only build the window the first time
-        if window == nil {
-            // Create the SwiftUI view hierarchy
-            let contentView = PauseView().environmentObject(manager)
-            
-            // Configure the native NSWindow instance
-            let newWindow = OverlayWindow(
+        // Rebuild every break so newly plugged-in monitors are covered
+        windows.forEach { $0.orderOut(nil) }
+        let mainScreen = NSScreen.main ?? NSScreen.screens.first
+
+        windows = NSScreen.screens.map { screen in
+            let window = OverlayWindow(
                 contentRect: screen.frame,
                 styleMask: .borderless,
                 backing: .buffered,
                 defer: false
             )
-            
-            newWindow.contentView = NSHostingView(rootView: contentView)
-            newWindow.backgroundColor = .black
-            newWindow.isOpaque = true
-            newWindow.hasShadow = false
-            newWindow.level = .screenSaver // Force it above the Dock and Menu Bar
-            newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary] // Show on every Space, even over fullscreen apps
-            
-            window = newWindow
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            // Force it above the Dock and Menu Bar, and show it on all spaces
+            window.hasShadow = false
+            window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+            let blur = NSVisualEffectView()
+            blur.material = .fullScreenUI
+            blur.blendingMode = .behindWindow
+            blur.state = .active
+            blur.appearance = NSAppearance(named: .darkAqua)
+            window.contentView = blur
+
+            // Only the main screen gets the prompt/breathing UI; others just blur + tint,
+            // so there is one countdown and one set of buttons
+            let host: NSView = screen == mainScreen
+                ? NSHostingView(rootView: PauseView().environmentObject(manager))
+                : NSHostingView(rootView: Color.black.opacity(0.4).ignoresSafeArea())
+            host.frame = blur.bounds
+            host.autoresizingMask = [.width, .height]
+            blur.addSubview(host)
+
+            window.setFrame(screen.frame, display: true)
+            window.alphaValue = 0
+            return window
         }
-        
-        // Stretch the window over the entire screen
-        window?.setFrame(screen.frame, display: true)
-        
-        // Force the app to focus and reveal the window
+
+        // Reveal invisibly, focus the main screen's window, then slowly fade all in together
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        for window in windows {
+            if window.screen == mainScreen { window.makeKeyAndOrderFront(nil) } else { window.orderFrontRegardless() }
+        }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 2.5
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            windows.forEach { $0.animator().alphaValue = 1 }
+        }
     }
-    
+
     func closeWindow() {
-        // Hide the window so it can be reused next break
-        window?.orderOut(nil)
+        let closing = windows
+        // Fade out, then hide the windows
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.8
+            closing.forEach { $0.animator().alphaValue = 0 }
+        }, completionHandler: {
+            closing.forEach { $0.orderOut(nil) }
+        })
     }
 }
 
@@ -100,11 +126,13 @@ class WindowManager {
     @StateObject private var breakManager = BreakManager()
     
     var body: some Scene {
-        MenuBarExtra("Pause", systemImage: "heart.badge.bolt") {
+        MenuBarExtra("Pause", systemImage: "pause") {
             Picker("Gap Duration", selection: $breakManager.selectedDuration) {
-                Text("20 minutes").tag(20)
+                Text("25 minutes").tag(25)
                 Text("30 minutes").tag(30)
-                Text("40 minutes").tag(40)
+                Text("45 minutes").tag(45)
+                Text("50 minutes").tag(50)
+                Text("60 minutes").tag(60)
             }
             .pickerStyle(.inline)
             .onChange(of: breakManager.selectedDuration) { _, _ in breakManager.startTimer() }
